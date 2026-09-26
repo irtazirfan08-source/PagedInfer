@@ -1,0 +1,37 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  test-engine:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install -r requirements.txt
+
+      - name: Test KV Memory Allocator
+        run: python test_memory.py
+
+      - name: Test Continuous Batching Scheduler
+        run: python test_scheduler.py
+
+      - name: Test Speculative Decoding
+        run: python test_speculative.py
+
+      - name: Run Benchmark Smoke Test
+        run: python -m paged_infer.benchmark.benchmark_serving
