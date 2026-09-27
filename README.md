@@ -1,5 +1,6 @@
 # PagedInfer: High-Throughput LLM Serving Engine with Paged KV-Cache & Continuous Batching
 
+[![CI](https://github.com/irtazirfan08-source/PagedInfer/actions/workflows/ci.yml/badge.svg)](https://github.com/irtazirfan08-source/PagedInfer/actions/workflows/ci.yml)
 [![Python](https://img.shields.io/badge/Python-3.10%2B-blue.svg)](https://www.python.org/)
 [![PyTorch](https://img.shields.io/badge/PyTorch-2.0+-ee4c2c.svg)](https://pytorch.org/)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.100+-009688.svg)](https://fastapi.tiangolo.com/)
