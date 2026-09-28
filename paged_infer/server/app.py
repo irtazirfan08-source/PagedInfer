@@ -1,6 +1,8 @@
+import json
 import uuid
-from typing import List
+from typing import Iterator, List
 from fastapi import FastAPI
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from paged_infer.memory.block_allocator import BlockAllocator
@@ -72,4 +74,55 @@ def generate(req: GenerateRequest):
         seq_id=sequence.seq_id,
         output_tokens=sequence.output_tokens,
         num_generated=len(sequence.output_tokens),
+    )
+
+
+def stream_token_generator(seq_id: str, max_new_tokens: int) -> Iterator[str]:
+    """Yields per-token SSE chunks as iterations complete in the engine."""
+    max_steps = max_new_tokens + 5
+    steps = 0
+    is_done = False
+
+    while not is_done and steps < max_steps:
+        steps += 1
+        active_batch = scheduler.schedule()
+        if not active_batch:
+            break
+
+        step_outputs = runner.step(active_batch)
+        emitted_token = None
+
+        for seq in active_batch:
+            token = step_outputs.get(seq.seq_id, 0)
+            allocator.append_slot(seq.seq_id, seq.get_len())
+            seq.append_token(token)
+            if seq.seq_id == seq_id:
+                emitted_token = token
+
+        if emitted_token is not None:
+            chunk = json.dumps({"seq_id": seq_id, "token_id": emitted_token})
+            yield f"data: {chunk}\n\n"
+
+        finished_seqs = scheduler.post_step()
+        for finished in finished_seqs:
+            if finished.seq_id == seq_id:
+                is_done = True
+                break
+
+    yield "data: [DONE]\n\n"
+
+
+@app.post("/generate/stream")
+def generate_stream(req: GenerateRequest):
+    seq_id = f"stream-{uuid.uuid4().hex[:6]}"
+    sequence = Sequence(
+        seq_id=seq_id,
+        prompt_tokens=req.prompt_tokens,
+        max_new_tokens=req.max_new_tokens,
+    )
+    scheduler.add_sequence(sequence)
+
+    return StreamingResponse(
+        stream_token_generator(seq_id, req.max_new_tokens),
+        media_type="text/event-stream",
     )
