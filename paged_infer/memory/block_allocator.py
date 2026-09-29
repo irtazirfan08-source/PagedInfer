@@ -1,84 +1,110 @@
-"""
-Paged KV-Cache Block Allocator
-Manages physical GPU/CPU memory blocks for token generation,
-preventing memory fragmentation by allocating fixed-size pages.
-"""
-
-from typing import List, Dict, Optional
-
-
-class PhysicalBlock:
-    """Represents one physical memory slot capable of holding `block_size` tokens."""
-    def __init__(self, block_id: int, block_size: int = 16):
-        self.block_id: int = block_id
-        self.block_size: int = block_size
-        self.ref_count: int = 0
-
-    def is_free(self) -> bool:
-        return self.ref_count == 0
+import math
+from typing import Dict, List, Optional, Tuple
 
 
 class BlockAllocator:
+    """Manages physical KV-cache memory blocks with dynamic allocation,
+    reference-counted prefix caching, and zero-fragmentation reclamation.
     """
-    Tracks free and allocated physical blocks.
-    Maps a sequence's logical token position to physical memory pages.
-    """
-    def __init__(self, num_blocks: int, block_size: int = 16):
-        self.num_blocks: int = num_blocks
-        self.block_size: int = block_size
-        
+
+    def __init__(self, num_blocks: int = 32, block_size: int = 16):
+        self.num_blocks = num_blocks
+        self.block_size = block_size
         self.free_blocks: List[int] = list(range(num_blocks))
-        self.all_blocks: Dict[int, PhysicalBlock] = {
-            i: PhysicalBlock(block_id=i, block_size=block_size) for i in range(num_blocks)
-        }
         self.block_tables: Dict[str, List[int]] = {}
+
+        # Prefix caching state
+        self.prefix_cache: Dict[Tuple[int, ...], int] = {}
+        self.block_ref_counts: Dict[int, int] = {i: 0 for i in range(num_blocks)}
+        self.cache_hits: int = 0
 
     def get_num_free_blocks(self) -> int:
         return len(self.free_blocks)
 
-    def can_allocate(self, num_required_blocks: int) -> bool:
-        return len(self.free_blocks) >= num_required_blocks
+    def allocate(
+        self,
+        seq_id: str,
+        num_tokens: int,
+        prompt_tokens: Optional[List[int]] = None,
+    ) -> List[int]:
+        """Allocates physical blocks for a sequence. Reuses cached blocks for
+        full token chunks of size `block_size` when prompt_tokens are supplied.
+        """
+        if seq_id in self.block_tables:
+            raise ValueError(f"Sequence {seq_id} already has allocated blocks.")
 
-    def allocate_sequence(self, seq_id: str, prompt_token_count: int) -> List[int]:
-        num_blocks_needed = (prompt_token_count + self.block_size - 1) // self.block_size
+        num_required_blocks = math.ceil(num_tokens / self.block_size)
+        allocated_table: List[int] = []
 
-        if not self.can_allocate(num_blocks_needed):
-            raise MemoryError(
-                f"Out of Memory: Needed {num_blocks_needed} blocks, but only {len(self.free_blocks)} available."
-            )
+        if prompt_tokens:
+            num_full_chunks = len(prompt_tokens) // self.block_size
+            for chunk_idx in range(num_full_chunks):
+                chunk = tuple(
+                    prompt_tokens[chunk_idx * self.block_size : (chunk_idx + 1) * self.block_size]
+                )
+                if chunk in self.prefix_cache:
+                    # Cache Hit: reuse existing block
+                    cached_block = self.prefix_cache[chunk]
+                    self.block_ref_counts[cached_block] += 1
+                    allocated_table.append(cached_block)
+                    self.cache_hits += 1
+                else:
+                    # Cache Miss: allocate new block and register prefix
+                    if not self.free_blocks:
+                        self._rollback_partial_allocation(allocated_table)
+                        raise MemoryError("Out of physical memory blocks during prefix allocation.")
+                    new_block = self.free_blocks.pop(0)
+                    self.prefix_cache[chunk] = new_block
+                    self.block_ref_counts[new_block] = 1
+                    allocated_table.append(new_block)
 
-        allocated_ids: List[int] = []
-        for _ in range(num_blocks_needed):
+        # Allocate remaining non-cached or partial blocks
+        remaining_blocks_needed = num_required_blocks - len(allocated_table)
+        if remaining_blocks_needed > len(self.free_blocks):
+            self._rollback_partial_allocation(allocated_table)
+            raise MemoryError("Out of physical memory blocks.")
+
+        for _ in range(remaining_blocks_needed):
             block_id = self.free_blocks.pop(0)
-            self.all_blocks[block_id].ref_count = 1
-            allocated_ids.append(block_id)
+            self.block_ref_counts[block_id] = 1
+            allocated_table.append(block_id)
 
-        self.block_tables[seq_id] = allocated_ids
-        return allocated_ids
+        self.block_tables[seq_id] = allocated_table
+        return allocated_table
 
-    def append_slot(self, seq_id: str, current_token_count: int) -> Optional[int]:
-        if seq_id not in self.block_tables:
-            raise KeyError(f"Sequence {seq_id} not registered in block table.")
+    def append_slot(self, seq_id: str, current_len: int) -> Optional[int]:
+        """Allocates a new block if sequence length crosses a block boundary."""
+        if current_len % self.block_size == 0:
+            if not self.free_blocks:
+                raise MemoryError(f"Out of physical memory blocks for sequence {seq_id}.")
+            new_block = self.free_blocks.pop(0)
+            self.block_ref_counts[new_block] = 1
+            self.block_tables[seq_id].append(new_block)
+            return new_block
+        return None
 
-        if current_token_count % self.block_size == 0:
-            if len(self.free_blocks) == 0:
-                raise MemoryError("KV-Cache Exhausted during token decoding phase.")
-            
-            new_block_id = self.free_blocks.pop(0)
-            self.all_blocks[new_block_id].ref_count = 1
-            self.block_tables[seq_id].append(new_block_id)
-            return new_block_id
-        
-        return self.block_tables[seq_id][-1]
-
-    def free_sequence(self, seq_id: str) -> None:
+    def free(self, seq_id: str) -> None:
+        """Decrements reference counts and reclaims blocks whose count drops to zero."""
         if seq_id not in self.block_tables:
             return
 
-        for block_id in self.block_tables[seq_id]:
-            block = self.all_blocks[block_id]
-            block.ref_count -= 1
-            if block.ref_count == 0:
+        blocks = self.block_tables.pop(seq_id)
+        for block_id in blocks:
+            self.block_ref_counts[block_id] -= 1
+            if self.block_ref_counts[block_id] == 0:
+                dead_keys = [k for k, v in self.prefix_cache.items() if v == block_id]
+                for k in dead_keys:
+                    del self.prefix_cache[k]
                 self.free_blocks.append(block_id)
 
-        del self.block_tables[seq_id]
+        self.free_blocks.sort()
+
+    def _rollback_partial_allocation(self, partial_blocks: List[int]) -> None:
+        for block_id in partial_blocks:
+            self.block_ref_counts[block_id] -= 1
+            if self.block_ref_counts[block_id] == 0:
+                dead_keys = [k for k, v in self.prefix_cache.items() if v == block_id]
+                for k in dead_keys:
+                    del self.prefix_cache[k]
+                self.free_blocks.append(block_id)
+        self.free_blocks.sort()

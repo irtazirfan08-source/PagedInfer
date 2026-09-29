@@ -27,6 +27,9 @@ jobs:
       - name: Test KV Memory Allocator
         run: python test_memory.py
 
+      - name: Test Prefix Caching Allocator
+        run: python test_prefix_cache.py
+
       - name: Test Continuous Batching Scheduler
         run: python test_scheduler.py
 
