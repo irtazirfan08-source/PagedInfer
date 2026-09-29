@@ -21,6 +21,13 @@ class BlockAllocator:
     def get_num_free_blocks(self) -> int:
         return len(self.free_blocks)
 
+    def can_allocate(self, num_tokens: int) -> bool:
+        required_blocks = math.ceil(num_tokens / self.block_size)
+        return len(self.free_blocks) >= required_blocks
+
+    def get_block_table(self, seq_id: str) -> List[int]:
+        return self.block_tables.get(seq_id, [])
+
     def allocate(
         self,
         seq_id: str,
@@ -43,13 +50,11 @@ class BlockAllocator:
                     prompt_tokens[chunk_idx * self.block_size : (chunk_idx + 1) * self.block_size]
                 )
                 if chunk in self.prefix_cache:
-                    # Cache Hit: reuse existing block
                     cached_block = self.prefix_cache[chunk]
                     self.block_ref_counts[cached_block] += 1
                     allocated_table.append(cached_block)
                     self.cache_hits += 1
                 else:
-                    # Cache Miss: allocate new block and register prefix
                     if not self.free_blocks:
                         self._rollback_partial_allocation(allocated_table)
                         raise MemoryError("Out of physical memory blocks during prefix allocation.")
@@ -58,7 +63,6 @@ class BlockAllocator:
                     self.block_ref_counts[new_block] = 1
                     allocated_table.append(new_block)
 
-        # Allocate remaining non-cached or partial blocks
         remaining_blocks_needed = num_required_blocks - len(allocated_table)
         if remaining_blocks_needed > len(self.free_blocks):
             self._rollback_partial_allocation(allocated_table)
@@ -72,9 +76,23 @@ class BlockAllocator:
         self.block_tables[seq_id] = allocated_table
         return allocated_table
 
-    def append_slot(self, seq_id: str, current_len: int) -> Optional[int]:
+    def allocate_sequence(self, seq_id: str, prompt_token_count: int) -> List[int]:
+        """Backward-compatible entry point for baseline memory allocation."""
+        return self.allocate(seq_id=seq_id, num_tokens=prompt_token_count)
+
+    def append_slot(
+        self,
+        seq_id: str,
+        current_token_count: Optional[int] = None,
+        current_len: Optional[int] = None,
+        **kwargs,
+    ) -> Optional[int]:
         """Allocates a new block if sequence length crosses a block boundary."""
-        if current_len % self.block_size == 0:
+        token_count = current_token_count if current_token_count is not None else current_len
+        if token_count is None:
+            raise ValueError("Token count must be provided to append_slot.")
+
+        if token_count % self.block_size == 0:
             if not self.free_blocks:
                 raise MemoryError(f"Out of physical memory blocks for sequence {seq_id}.")
             new_block = self.free_blocks.pop(0)
@@ -98,6 +116,10 @@ class BlockAllocator:
                 self.free_blocks.append(block_id)
 
         self.free_blocks.sort()
+
+    def free_sequence(self, seq_id: str) -> None:
+        """Backward-compatible entry point for freeing memory."""
+        self.free(seq_id)
 
     def _rollback_partial_allocation(self, partial_blocks: List[int]) -> None:
         for block_id in partial_blocks:
